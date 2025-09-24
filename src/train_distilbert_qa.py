@@ -367,8 +367,6 @@ def main():
     )
 
     # Modelos e métricas
-    metric = evaluate.load("squad")
-
     def compute_metrics(eval_pred):
         """
         Recebe o resultado do post_process_function:
