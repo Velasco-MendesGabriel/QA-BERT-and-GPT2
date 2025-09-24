@@ -1,6 +1,6 @@
 # spaces/app.py
 import os
-import gradio as gr
+import deploy_space as gr
 import torch
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForQuestionAnswering
