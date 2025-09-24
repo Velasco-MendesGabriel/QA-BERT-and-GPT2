@@ -168,35 +168,45 @@ def prepare_validation_features(examples, tokenizer, max_length=384, doc_stride=
 # Pós-processamento (SQuAD)
 # ----------------------------
 def postprocess_qa_predictions(
-        examples,
-        features,
-        predictions: Tuple[np.ndarray, np.ndarray],
-        tokenizer,
-        n_best_size=20,
-        max_answer_length=30,
+    examples,
+    features,
+    predictions: Tuple[np.ndarray, np.ndarray],
+    tokenizer,
+    n_best_size=20,
+    max_answer_length=30,
 ):
     """
     Converte logits (start, end) em textos de resposta por exemplo.
     Retorna dict: example_id -> {"text": best_answer, "n_best": [...]}.
     """
     all_start_logits, all_end_logits = predictions
+
+    # Mapeia example_id -> índice no Dataset 'examples'
+    example_id_to_index = {ex_id: i for i, ex_id in enumerate(examples["id"])}
+
+    # Para cada feature, guarda quais índices pertencem a cada example_id
     features_per_example = collections.defaultdict(list)
     for i, f in enumerate(features):
-        features_per_example[f["example_id"]].append(i)
+        # 'features[i]' funciona; mas iterar já entrega dicts linha-a-linha
+        ex_id = f["example_id"]
+        features_per_example[ex_id].append(i)
 
     final_predictions = {}
     softmax = lambda x: np.exp(x - np.max(x)) / np.exp(x - np.max(x)).sum()
 
     for example_id, feature_indices in features_per_example.items():
-        context = examples[examples["id"] == example_id]["context"][0]
+        # Acessa o contexto pelo índice inteiro
+        ex_idx = example_id_to_index[example_id]
+        context = examples[ex_idx]["context"]
+
         prelim = []
         for fi in feature_indices:
             start_logits = all_start_logits[fi]
-            end_logits = all_end_logits[fi]
-            offsets = features[fi]["offset_mapping"]
+            end_logits   = all_end_logits[fi]
+            offsets      = features[fi]["offset_mapping"]
 
             start_indexes = np.argsort(start_logits)[-n_best_size:][::-1]
-            end_indexes = np.argsort(end_logits)[-n_best_size:][::-1]
+            end_indexes   = np.argsort(end_logits)[-n_best_size:][::-1]
 
             for s in start_indexes:
                 for e in end_indexes:
@@ -208,33 +218,34 @@ def postprocess_qa_predictions(
                     if length > max_answer_length:
                         continue
                     start_char, _ = offsets[s]
-                    _, end_char = offsets[e]
+                    _, end_char   = offsets[e]
                     if start_char is None or end_char is None:
                         continue
-                    text = context[start_char:end_char]
-                    score = start_logits[s] + end_logits[e]
-                    prelim.append({"text": text, "score": float(score)})
+                    text  = context[start_char:end_char]
+                    score = float(start_logits[s] + end_logits[e])
+                    if text.strip():
+                        prelim.append({"text": text, "score": score})
 
-        if len(prelim) == 0:
+        if not prelim:
             final_predictions[example_id] = {"text": "", "n_best": []}
             continue
 
+        # Dedup por texto + softmax
         by_text = {}
         for p in prelim:
             t = p["text"].strip()
-            if t == "":
+            if not t:
                 continue
             if t not in by_text or p["score"] > by_text[t]["score"]:
                 by_text[t] = p
 
         nbest = sorted(by_text.values(), key=lambda x: x["score"], reverse=True)[:n_best_size]
         scores = np.array([x["score"] for x in nbest], dtype=np.float64)
-        probs = softmax(scores)
+        probs  = softmax(scores)
         for i, p in enumerate(nbest):
             p["prob"] = float(probs[i])
 
         final_predictions[example_id] = {"text": nbest[0]["text"], "n_best": nbest}
-
     return final_predictions
 
 # ----------------------------
