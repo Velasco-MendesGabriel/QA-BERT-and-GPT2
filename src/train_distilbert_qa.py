@@ -8,8 +8,64 @@ import collections
 import json
 import numpy as np
 from typing import List, Tuple
+import re
+# --- Métricas locais: EM e F1 no estilo SQuAD ---
+_punc_re = re.compile(r"[^\w\s]", flags=re.UNICODE)
 
-import torch  # << ADICIONADO
+def _normalize(s: str) -> str:
+    s = (s or "").lower().strip()
+    # remove pontuação
+    s = _punc_re.sub(" ", s)
+    # remove artigos simples (inglês)
+    s = " ".join(w for w in s.split() if w not in {"a", "an", "the"})
+    return " ".join(s.split())
+
+def _f1_score(pred: str, gold: str) -> float:
+    p_toks = _normalize(pred).split()
+    g_toks = _normalize(gold).split()
+    if len(p_toks) == 0 and len(g_toks) == 0:
+        return 1.0
+    if len(p_toks) == 0 or len(g_toks) == 0:
+        return 0.0
+    common = {}
+    for t in p_toks:
+        common[t] = common.get(t, 0) + 1
+    overlap = 0
+    for t in g_toks:
+        if common.get(t, 0) > 0:
+            overlap += 1
+            common[t] -= 1
+    if overlap == 0:
+        return 0.0
+    precision = overlap / len(p_toks)
+    recall = overlap / len(g_toks)
+    return 2 * precision * recall / (precision + recall)
+
+def _exact_match_score(pred: str, gold: str) -> bool:
+    return _normalize(pred) == _normalize(gold)
+
+def squad_em_f1(predictions, references):
+    """
+    predictions: [{"id": "...", "prediction_text": "..."}]
+    references : [{"id": "...", "answers": {"text": [...], "answer_start": [...]}}]
+    """
+    ref_map = {r["id"]: r["answers"]["text"] for r in references}
+    em, f1, n = 0.0, 0.0, 0
+    for p in predictions:
+        pid = p["id"]
+        pred_text = p.get("prediction_text", "")
+        gold_texts = ref_map.get(pid, [""])
+        # pega o melhor contra múltiplas referências (se houver)
+        em_i = max(_exact_match_score(pred_text, g) for g in gold_texts) if gold_texts else 0.0
+        f1_i = max(_f1_score(pred_text, g) for g in gold_texts) if gold_texts else 0.0
+        em += float(em_i)
+        f1 += float(f1_i)
+        n += 1
+    if n == 0:
+        return {"exact_match": 0.0, "f1": 0.0}
+    return {"exact_match": 100.0 * em / n, "f1": 100.0 * f1 / n}
+
+import torch
 from datasets import load_from_disk, DatasetDict
 from transformers import (
     AutoTokenizer,
@@ -18,7 +74,7 @@ from transformers import (
     Trainer,
     default_data_collator,
 )
-import evaluate
+
 
 
 # ----------------------------
@@ -315,10 +371,11 @@ def main():
 
     def compute_metrics(eval_pred):
         """
-        Esta função é chamada após o post_process (ver abaixo),
-        então recebe dicionários já com 'predictions' e 'references'.
+        Recebe o resultado do post_process_function:
+          - eval_pred.predictions: [{"id", "prediction_text"}]
+          - eval_pred.label_ids : [{"id", "answers": {...}}]
         """
-        return metric.compute(predictions=eval_pred.predictions, references=eval_pred.label_ids)
+        return squad_em_f1(eval_pred.predictions, eval_pred.label_ids)
 
     # Pós-processamento para o Trainer (conecta features → textos)
     def post_processing_function(examples, features, predictions, stage="eval"):
