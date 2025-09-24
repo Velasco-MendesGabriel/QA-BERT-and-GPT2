@@ -358,7 +358,7 @@ def main():
             tokenizer=tokenizer,
             data_collator=default_data_collator,
         )
-        preds = tmp_trainer.predict(eval_dataset=eval_ds_for_trainer)
+        preds = tmp_trainer.predict(eval_ds_for_trainer)
         pp = postprocess_qa_predictions(
             examples=eval_examples,
             features=eval_feats,
