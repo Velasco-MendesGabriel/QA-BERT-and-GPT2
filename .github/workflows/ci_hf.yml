@@ -108,3 +108,11 @@ jobs:
         with:
           name: distilbert_qa_outputs
           path: outputs/distilbert_qa
+
+      - name: Upload predictions & metrics
+          uses: actions/upload-artifact@v4
+          with:
+            name: distilbert_reports
+            path: |
+              outputs/distilbert_qa/sample_predictions.json
+              outputs/distilbert_qa/metrics_summary.json
