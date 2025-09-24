@@ -1,0 +1,110 @@
+name: ci-hf-distilbert
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "src/**"
+      - ".github/workflows/**"
+      - "requirements.txt"
+
+env:
+  HF_USERNAME: gkovacsvelasco
+  HF_MODEL_ID: gkovacsvelasco/distilbert-qa-qasports
+  DATA_DIR: data/processed/qasports_soccer_basketball
+  MAX_PER_SPORT: "5000"   # ajuste p/ +rápido ou +lento
+  EPOCHS: "1"
+  TRAIN_BS: "8"
+  EVAL_BS: "8"
+  GRAD_ACCUM: "2"
+  LR: "3e-5"
+
+jobs:
+  prepare_data:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (no torch yet)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare dataset (subset soccer+basketball)
+        run: |
+          python src/data/prepare_qasports.py \
+            --dataset PedroCJardim/QASports \
+            --splits train,validation \
+            --max-per-sport ${MAX_PER_SPORT} \
+            --out ${DATA_DIR}
+          ls -R ${DATA_DIR}
+
+      - name: Upload dataset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qasports_subset
+          path: ${{ env.DATA_DIR }}
+
+  train_and_push:
+    needs: prepare_data
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download dataset artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: qasports_subset
+          path: ${{ env.DATA_DIR }}
+
+      - name: Install deps + torch cpu
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: HF Auth
+        env:
+          HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+        run: |
+          python - << 'PY'
+          import os, subprocess
+          token = os.environ["HUGGINGFACE_TOKEN"]
+          subprocess.run(["python","-m","huggingface_hub","login","--token",token,"--add-to-git-credential"], check=True)
+          PY
+
+      - name: Train DistilBERT QA (CPU, subset)
+        env:
+          HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+        run: |
+          python src/train_distilbert_qa.py \
+            --data_dir ${DATA_DIR} \
+            --base_model distilbert-base-uncased \
+            --output_dir outputs/distilbert_qa \
+            --epochs ${EPOCHS} \
+            --train_batch ${TRAIN_BS} \
+            --eval_batch ${EVAL_BS} \
+            --grad_accum ${GRAD_ACCUM} \
+            --lr ${LR} \
+            --push_to_hub \
+            --hub_model_id ${HF_MODEL_ID}
+
+      - name: Upload model artifact (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: distilbert_qa_outputs
+          path: outputs/distilbert_qa
