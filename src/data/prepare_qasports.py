@@ -99,8 +99,8 @@ def main():
             ds = load_dataset(args.dataset, split="train")
 
         soccer = sample_by_sport(ds, is_soccer, max_n=args.max_per_sport, seed=args.seed)
-+       basket = sample_by_sport(ds, is_basket, max_n=args.max_per_sport, seed=args.seed)
-+       both = concatenate_datasets([soccer, basket])
+        basket = sample_by_sport(ds, is_basket, max_n=args.max_per_sport, seed=args.seed)
+        both = concatenate_datasets([soccer, basket])
 
         # Converte para squad-like
         both = both.map(to_squad_like, remove_columns=[c for c in both.column_names if c not in ("id", "question", "context", "answers", "context_title", "url")])
