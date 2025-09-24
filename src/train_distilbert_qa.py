@@ -9,6 +9,7 @@ import json
 import numpy as np
 from typing import List, Tuple
 
+import torch  # << ADICIONADO
 from datasets import load_from_disk, DatasetDict
 from transformers import (
     AutoTokenizer,
@@ -203,59 +204,61 @@ def postprocess_qa_predictions(
 # Utilitário: extrair Top-K por pergunta única
 # ----------------------------
 def topk_answers_for_single_qa(model, tokenizer, question: str, context: str, k: int = 3):
-    inputs = tokenizer(question, context, return_tensors="pt", truncation="only_second", max_length=384)
-    with np.no_grad:  # noqa
-        outputs = model(**{k: v for k, v in inputs.items()})
-    start = outputs.start_logits.detach().numpy()[0]
-    end = outputs.end_logits.detach().numpy()[0]
+    # tokenização com offsets (necessário para recortar do contexto)
+    enc = tokenizer(
+        question, context,
+        return_tensors="pt",
+        truncation="only_second",
+        max_length=384,
+        stride=128,
+        return_offsets_mapping=True
+    )
+    with torch.no_grad():  # << TROCA NP.NO_GRAD POR TORCH.NO_GRAD
+        out = model(**{kk: vv for kk, vv in enc.items() if kk in ("input_ids","attention_mask","token_type_ids")})
 
-    # Busca combinatória simples (como no postprocess) + softmax
+    start = out.start_logits[0].cpu().numpy()
+    end   = out.end_logits[0].cpu().numpy()
+
+    # candidatos
     n_best_size = 20
     max_answer_length = 30
     start_idx = np.argsort(start)[-n_best_size:][::-1]
-    end_idx = np.argsort(end)[-n_best_size:][::-1]
+    end_idx   = np.argsort(end)[-n_best_size:][::-1]
+
+    # offsets e ids de sequência (para filtrar só tokens do contexto)
+    offsets = enc["offset_mapping"][0].cpu().numpy().tolist()
+    seq_ids = enc.sequence_ids(0)  # requer tokenizer rápido
+    ctx_token_ids = {i for i, sid in enumerate(seq_ids) if sid == 1}
+
     prelim = []
     for s in start_idx:
         for e in end_idx:
             if e < s or (e - s + 1) > max_answer_length:
                 continue
-            score = start[s] + end[e]
-            prelim.append((s, e, score))
+            if s not in ctx_token_ids or e not in ctx_token_ids:
+                continue
+            sc, _ = offsets[s]
+            _, ec = offsets[e]
+            if sc is None or ec is None:
+                continue
+            text = context[sc:ec].strip()  # << RECORTE SEMPRE DO CONTEXTO
+            if not text:
+                continue
+            score = float(start[s] + end[e])
+            prelim.append({"text": text, "score": score})
 
-    prelim.sort(key=lambda x: x[2], reverse=True)
-    prelim = prelim[:n_best_size]
-
-    # Para mapear tokens→texto, precisamos de offsets (tokenizer rápido)
-    encoded = tokenizer(question, context, return_offsets_mapping=True, truncation="only_second", max_length=384)
-    offsets = encoded["offset_mapping"]
-    sequence_ids = encoded.sequence_ids()
-    # Limita a spans somente no contexto
-    context_token_ids = [i for i, sid in enumerate(sequence_ids) if sid == 1]
-
-    candidates = []
-    for s, e, score in prelim:
-        if s not in context_token_ids or e not in context_token_ids:
-            continue
-        start_char, _ = offsets[s]
-        _, end_char = offsets[e]
-        text = (question + " " + context)[start_char:end_char] if start_char is not None and end_char is not None else ""
-        candidates.append({"text": text, "score": float(score)})
-
-    if not candidates:
+    if not prelim:
         return []
 
-    # Consolida + softmax
+    # dedup + softmax
     by_text = {}
-    for c in candidates:
-        t = c["text"].strip()
-        if t == "":
-            continue
-        if t not in by_text or c["score"] > by_text[t]["score"]:
-            by_text[t] = c
+    for p in prelim:
+        t = p["text"]
+        if t not in by_text or p["score"] > by_text[t]["score"]:
+            by_text[t] = p
     nbest = sorted(by_text.values(), key=lambda x: x["score"], reverse=True)[:k]
     scores = np.array([x["score"] for x in nbest], dtype=np.float64)
-    probs = np.exp(scores - scores.max())
-    probs /= probs.sum()
+    probs = np.exp(scores - scores.max()); probs /= probs.sum()
     for i, nb in enumerate(nbest):
         nb["prob"] = float(probs[i])
     return nbest
@@ -303,7 +306,7 @@ def main():
     eval_feats = eval_examples.map(
         lambda ex: prepare_validation_features(ex, tokenizer, args.max_length, args.doc_stride),
         batched=True,
-        remove_columns=[],
+        remove_columns=eval_examples.column_names,  # remove as colunas originais (evita ArrowInvalid)
         desc="Tokenizing eval",
     )
 
@@ -404,50 +407,53 @@ def main():
         ex = eval_examples[idx]
         q = ex["question"]
         ctx = ex["context"]
-        # Reaproveita o próprio modelo fine-tuned
-        with np.no_grad:  # noqa
-            pass
-        # Implementação de topk usando logits + softmax (como no postprocess)
-        inputs = tokenizer(q, ctx, return_tensors="pt", truncation="only_second", max_length=args.max_length)
-        outputs = ft_model(**{k: v for k, v in inputs.items()})
-        start = outputs.start_logits.detach().numpy()[0]
-        end = outputs.end_logits.detach().numpy()[0]
+
+        # Tokenização com offsets para recorte do CONTEXTO
+        enc = tokenizer(
+            q, ctx,
+            return_tensors="pt",
+            truncation="only_second",
+            max_length=args.max_length,
+            stride=args.doc_stride,
+            return_offsets_mapping=True
+        )
+        with torch.no_grad():  # << TROCA NP.NO_GRAD POR TORCH.NO_GRAD
+            out = ft_model(**{kk: vv for kk, vv in enc.items() if kk in ("input_ids","attention_mask","token_type_ids")})
+
+        start = out.start_logits[0].cpu().numpy()
+        end   = out.end_logits[0].cpu().numpy()
 
         # Busca combinatória top-n
         n_best_size = 20
         max_answer_length = 30
         start_idx = np.argsort(start)[-n_best_size:][::-1]
-        end_idx = np.argsort(end)[-n_best_size:][::-1]
+        end_idx   = np.argsort(end)[-n_best_size:][::-1]
+
+        # offsets + sequence_ids(0) para filtrar só tokens do CONTEXTO
+        offsets = enc["offset_mapping"][0].cpu().numpy().tolist()
+        seq_ids = enc.sequence_ids(0)
+        context_token_ids = {i for i, sid in enumerate(seq_ids) if sid == 1}
+
         prelim = []
         for s in start_idx:
             for e in end_idx:
                 if e < s or (e - s + 1) > max_answer_length:
                     continue
-                prelim.append((s, e, float(start[s] + end[e])))
+                if s not in context_token_ids or e not in context_token_ids:
+                    continue
+                sc, _ = offsets[s]
+                _, ec = offsets[e]
+                if sc is None or ec is None:
+                    continue
+                text = ctx[sc:ec].strip()  # << RECORTE DO CONTEXTO
+                if not text:
+                    continue
+                score = float(start[s] + end[e])
+                prelim.append({"text": text, "score": score})
 
-        prelim.sort(key=lambda x: x[2], reverse=True)
-        prelim = prelim[:n_best_size]
-
-        # offsets para recortar texto do contexto
-        enc = tokenizer(q, ctx, return_offsets_mapping=True, truncation="only_second", max_length=args.max_length)
-        offsets = enc["offset_mapping"]
-        seq_ids = enc.sequence_ids()
-        context_token_ids = [i for i, sid in enumerate(seq_ids) if sid == 1]
-
-        cands = []
-        for s, e, score in prelim:
-            if s not in context_token_ids or e not in context_token_ids:
-                continue
-            sc, _ = offsets[s]
-            _, ec = offsets[e]
-            if sc is None or ec is None:
-                continue
-            text = (q + " " + ctx)[sc:ec] if sc < len(q + " " + ctx) and ec <= len(q + " " + ctx) else ctx[sc:ec]
-            cands.append({"text": text.strip(), "score": score})
-
-        # consolida + softmax
+        # dedup + softmax
         dedup = {}
-        for c in cands:
+        for c in prelim:
             t = c["text"]
             if not t:
                 continue
@@ -456,8 +462,7 @@ def main():
         nbest = sorted(dedup.values(), key=lambda x: x["score"], reverse=True)[:3]
         if nbest:
             scores = np.array([x["score"] for x in nbest], dtype=np.float64)
-            probs = np.exp(scores - scores.max())
-            probs /= probs.sum()
+            probs = np.exp(scores - scores.max()); probs /= probs.sum()
             for i, nb in enumerate(nbest):
                 nb["prob"] = float(probs[i])
 

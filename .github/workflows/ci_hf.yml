@@ -24,6 +24,9 @@ env:
 jobs:
   prepare_data:
     runs-on: ubuntu-latest
+    #strategy:
+    #  matrix:
+    #    model: [distilbert, distilgpt2]
     steps:
       - uses: actions/checkout@v4
 
