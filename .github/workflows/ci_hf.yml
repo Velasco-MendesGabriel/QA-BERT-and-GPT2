@@ -19,6 +19,7 @@ env:
   EVAL_BS: "8"
   GRAD_ACCUM: "2"
   LR: "3e-5"
+  HUGGINGFACE_HUB_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
 
 jobs:
   prepare_data:
@@ -26,10 +27,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python + pip cache
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.x"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+
+      - name: Cache Hugging Face ~/.cache/huggingface
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            hf-${{ runner.os }}-
 
       - name: Install deps
         run: |
@@ -60,10 +72,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python + pip cache
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.x"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+
+      - name: Cache Hugging Face ~/.cache/huggingface
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            hf-${{ runner.os }}-
 
       - name: Download dataset artifact
         uses: actions/download-artifact@v4
@@ -77,19 +100,7 @@ jobs:
           pip install -r requirements.txt
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      - name: HF Auth
-        env:
-          HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
-        run: |
-          python - << 'PY'
-          import os, subprocess
-          token = os.environ["HUGGINGFACE_TOKEN"]
-          subprocess.run(["python","-m","huggingface_hub","login","--token",token,"--add-to-git-credential"], check=True)
-          PY
-
       - name: Train DistilBERT QA (CPU, subset)
-        env:
-          HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
         run: |
           python src/train_distilbert_qa.py \
             --data_dir ${DATA_DIR} \
@@ -103,7 +114,7 @@ jobs:
             --push_to_hub \
             --hub_model_id ${HF_MODEL_ID}
 
-      - name: Upload model artifact (optional)
+      - name: Upload model artifact
         uses: actions/upload-artifact@v4
         with:
           name: distilbert_qa_outputs
@@ -116,3 +127,30 @@ jobs:
           path: |
             outputs/distilbert_qa/sample_predictions.json
             outputs/distilbert_qa/metrics_summary.json
+
+  deploy_space:
+    needs: train_and_push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python + pip cache
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+
+      - name: Install hub client
+        run: |
+          python -m pip install --upgrade pip
+          pip install huggingface_hub>=0.24.5
+
+      - name: Create/Update Space (Gradio)
+        env:
+          HF_TOKEN: ${{ env.HUGGINGFACE_HUB_TOKEN }}
+          HF_SPACE_ID: gkovacsvelasco/sports-qa-demo
+          HF_MODEL_ID: ${{ env.HF_MODEL_ID }}
+        run: |
+          python spaces/gradio.py
