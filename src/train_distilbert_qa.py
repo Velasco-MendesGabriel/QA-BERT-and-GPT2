@@ -7,17 +7,25 @@ from pathlib import Path
 import collections
 import json
 import numpy as np
-from typing import List, Tuple
+from typing import Tuple
 import re
+import torch
+from datasets import load_from_disk, DatasetDict
+from transformers import (
+    AutoTokenizer,
+    AutoModelForQuestionAnswering,
+    TrainingArguments,
+    Trainer,
+    default_data_collator,
+)
+
 # --- Métricas locais: EM e F1 no estilo SQuAD ---
 _punc_re = re.compile(r"[^\w\s]", flags=re.UNICODE)
 
 def _normalize(s: str) -> str:
     s = (s or "").lower().strip()
-    # remove pontuação
-    s = _punc_re.sub(" ", s)
-    # remove artigos simples (inglês)
-    s = " ".join(w for w in s.split() if w not in {"a", "an", "the"})
+    s = _punc_re.sub(" ", s)  # remove pontuação
+    s = " ".join(w for w in s.split() if w not in {"a", "an", "the"})  # remove artigos simples (inglês)
     return " ".join(s.split())
 
 def _f1_score(pred: str, gold: str) -> float:
@@ -55,7 +63,6 @@ def squad_em_f1(predictions, references):
         pid = p["id"]
         pred_text = p.get("prediction_text", "")
         gold_texts = ref_map.get(pid, [""])
-        # pega o melhor contra múltiplas referências (se houver)
         em_i = max(_exact_match_score(pred_text, g) for g in gold_texts) if gold_texts else 0.0
         f1_i = max(_f1_score(pred_text, g) for g in gold_texts) if gold_texts else 0.0
         em += float(em_i)
@@ -65,23 +72,10 @@ def squad_em_f1(predictions, references):
         return {"exact_match": 0.0, "f1": 0.0}
     return {"exact_match": 100.0 * em / n, "f1": 100.0 * f1 / n}
 
-import torch
-from datasets import load_from_disk, DatasetDict
-from transformers import (
-    AutoTokenizer,
-    AutoModelForQuestionAnswering,
-    TrainingArguments,
-    Trainer,
-    default_data_collator,
-)
-
-
-
 # ----------------------------
 # Pré-processamento (train/eval)
 # ----------------------------
 def prepare_train_features(examples, tokenizer, max_length=384, doc_stride=128):
-    # Tokeniza com mapeamento e janela deslizante sobre o contexto
     tokenized = tokenizer(
         examples["question"],
         examples["context"],
@@ -92,7 +86,6 @@ def prepare_train_features(examples, tokenizer, max_length=384, doc_stride=128):
         return_offsets_mapping=True,
         padding="max_length",
     )
-
     sample_mapping = tokenized.pop("overflow_to_sample_mapping")
     offset_mapping = tokenized.pop("offset_mapping")
 
@@ -122,12 +115,10 @@ def prepare_train_features(examples, tokenizer, max_length=384, doc_stride=128):
         start_char = answers["answer_start"][0]
         end_char = start_char + len(answers["text"][0])
 
-        # Se a resposta não cabe no contexto desta janela → CLS
         if not (offsets[context_start][0] <= start_char and offsets[context_end][1] >= end_char):
             start_positions.append(cls_index)
             end_positions.append(cls_index)
         else:
-            # Mapeia char→token
             idx_start = context_start
             while idx_start < len(offsets) and offsets[idx_start][0] <= start_char:
                 idx_start += 1
@@ -142,9 +133,7 @@ def prepare_train_features(examples, tokenizer, max_length=384, doc_stride=128):
     tokenized["end_positions"] = end_positions
     return tokenized
 
-
 def prepare_validation_features(examples, tokenizer, max_length=384, doc_stride=128):
-    # Para avaliação, precisamos manter offset_mapping e o mapeamento para exemplos originais
     tokenized = tokenizer(
         examples["question"],
         examples["context"],
@@ -155,7 +144,6 @@ def prepare_validation_features(examples, tokenizer, max_length=384, doc_stride=
         return_offsets_mapping=True,
         padding="max_length",
     )
-
     sample_mapping = tokenized.pop("overflow_to_sample_mapping")
     tokenized["example_id"] = []
 
@@ -166,6 +154,7 @@ def prepare_validation_features(examples, tokenizer, max_length=384, doc_stride=
     # Mantém offset_mapping apenas para tokens do contexto; zera o resto
     offset_mapping = tokenized["offset_mapping"]
     sequence_ids_list = [tokenized.sequence_ids(i) for i in range(len(tokenized["input_ids"]))]
+
     new_offsets = []
     for offsets, sequence_ids in zip(offset_mapping, sequence_ids_list):
         new_offsets.append([
@@ -174,7 +163,6 @@ def prepare_validation_features(examples, tokenizer, max_length=384, doc_stride=
         ])
     tokenized["offset_mapping"] = new_offsets
     return tokenized
-
 
 # ----------------------------
 # Pós-processamento (SQuAD)
@@ -188,12 +176,10 @@ def postprocess_qa_predictions(
         max_answer_length=30,
 ):
     """
-    Converte logits (start, end) em textos de resposta por exemplo,
-    seguindo a lógica padrão do SQuAD (n-best + restrições).
+    Converte logits (start, end) em textos de resposta por exemplo.
     Retorna dict: example_id -> {"text": best_answer, "n_best": [...]}.
     """
     all_start_logits, all_end_logits = predictions
-    example_id_to_index = {k: i for i, k in enumerate(examples["id"])}
     features_per_example = collections.defaultdict(list)
     for i, f in enumerate(features):
         features_per_example[f["example_id"]].append(i)
@@ -203,7 +189,6 @@ def postprocess_qa_predictions(
 
     for example_id, feature_indices in features_per_example.items():
         context = examples[examples["id"] == example_id]["context"][0]
-
         prelim = []
         for fi in feature_indices:
             start_logits = all_start_logits[fi]
@@ -234,7 +219,6 @@ def postprocess_qa_predictions(
             final_predictions[example_id] = {"text": "", "n_best": []}
             continue
 
-        # Consolida duplicatas por texto (pega maior score)
         by_text = {}
         for p in prelim:
             t = p["text"].strip()
@@ -244,8 +228,6 @@ def postprocess_qa_predictions(
                 by_text[t] = p
 
         nbest = sorted(by_text.values(), key=lambda x: x["score"], reverse=True)[:n_best_size]
-
-        # Probabilidades normalizadas (softmax dos scores)
         scores = np.array([x["score"] for x in nbest], dtype=np.float64)
         probs = softmax(scores)
         for i, p in enumerate(nbest):
@@ -255,12 +237,10 @@ def postprocess_qa_predictions(
 
     return final_predictions
 
-
 # ----------------------------
 # Utilitário: extrair Top-K por pergunta única
 # ----------------------------
 def topk_answers_for_single_qa(model, tokenizer, question: str, context: str, k: int = 3):
-    # tokenização com offsets (necessário para recortar do contexto)
     enc = tokenizer(
         question, context,
         return_tensors="pt",
@@ -269,21 +249,19 @@ def topk_answers_for_single_qa(model, tokenizer, question: str, context: str, k:
         stride=128,
         return_offsets_mapping=True
     )
-    with torch.no_grad():  # << TROCA NP.NO_GRAD POR TORCH.NO_GRAD
+    with torch.no_grad():
         out = model(**{kk: vv for kk, vv in enc.items() if kk in ("input_ids","attention_mask","token_type_ids")})
 
     start = out.start_logits[0].cpu().numpy()
     end   = out.end_logits[0].cpu().numpy()
 
-    # candidatos
     n_best_size = 20
     max_answer_length = 30
     start_idx = np.argsort(start)[-n_best_size:][::-1]
     end_idx   = np.argsort(end)[-n_best_size:][::-1]
 
-    # offsets e ids de sequência (para filtrar só tokens do contexto)
     offsets = enc["offset_mapping"][0].cpu().numpy().tolist()
-    seq_ids = enc.sequence_ids(0)  # requer tokenizer rápido
+    seq_ids = enc.sequence_ids(0)  # tokenizer rápido
     ctx_token_ids = {i for i, sid in enumerate(seq_ids) if sid == 1}
 
     prelim = []
@@ -297,7 +275,7 @@ def topk_answers_for_single_qa(model, tokenizer, question: str, context: str, k:
             _, ec = offsets[e]
             if sc is None or ec is None:
                 continue
-            text = context[sc:ec].strip()  # << RECORTE SEMPRE DO CONTEXTO
+            text = context[sc:ec].strip()
             if not text:
                 continue
             score = float(start[s] + end[e])
@@ -306,7 +284,6 @@ def topk_answers_for_single_qa(model, tokenizer, question: str, context: str, k:
     if not prelim:
         return []
 
-    # dedup + softmax
     by_text = {}
     for p in prelim:
         t = p["text"]
@@ -318,7 +295,6 @@ def topk_answers_for_single_qa(model, tokenizer, question: str, context: str, k:
     for i, nb in enumerate(nbest):
         nb["prob"] = float(probs[i])
     return nbest
-
 
 # ----------------------------
 # Main
@@ -362,55 +338,43 @@ def main():
     eval_feats = eval_examples.map(
         lambda ex: prepare_validation_features(ex, tokenizer, args.max_length, args.doc_stride),
         batched=True,
-        remove_columns=eval_examples.column_names,  # remove as colunas originais (evita ArrowInvalid)
+        remove_columns=eval_examples.column_names,
         desc="Tokenizing eval",
     )
 
-    # Modelos e métricas
-    def compute_metrics(eval_pred):
-        """
-        Recebe o resultado do post_process_function:
-          - eval_pred.predictions: [{"id", "prediction_text"}]
-          - eval_pred.label_ids : [{"id", "answers": {...}}]
-        """
-        return squad_em_f1(eval_pred.predictions, eval_pred.label_ids)
-
-    # Pós-processamento para o Trainer (conecta features → textos)
-    def post_processing_function(examples, features, predictions, stage="eval"):
-        preds = postprocess_qa_predictions(
-            examples=examples,
-            features=features,
-            predictions=predictions,
+    # ---------- Helper de avaliação (predict → postprocess → EM/F1) ----------
+    def evaluate_model(model, eval_examples, eval_feats, prefix="eval"):
+        eval_ds_for_trainer = eval_feats.remove_columns(
+            [c for c in eval_feats.column_names if c not in ("input_ids", "attention_mask")]
+        )
+        tmp_trainer = Trainer(
+            model=model,
+            args=TrainingArguments(
+                output_dir=os.path.join(args.output_dir, f"{prefix}_tmp"),
+                per_device_eval_batch_size=args.eval_batch,
+                report_to="none",
+                seed=args.seed,
+            ),
+            tokenizer=tokenizer,
+            data_collator=default_data_collator,
+        )
+        preds = tmp_trainer.predict(eval_dataset=eval_ds_for_trainer)
+        pp = postprocess_qa_predictions(
+            examples=eval_examples,
+            features=eval_feats,
+            predictions=preds.predictions,  # (start_logits, end_logits)
             tokenizer=tokenizer,
             n_best_size=20,
             max_answer_length=30,
         )
-        # Constrói pares para a métrica SQuAD
-        formatted_predictions = [{"id": k, "prediction_text": v["text"]} for k, v in preds.items()]
-        references = [{"id": ex["id"], "answers": ex["answers"]} for ex in examples]
-        return {"predictions": formatted_predictions, "label_ids": references}
+        formatted_predictions = [{"id": k, "prediction_text": v["text"]} for k, v in pp.items()]
+        references = [{"id": ex["id"], "answers": ex["answers"]} for ex in eval_examples]
+        return squad_em_f1(formatted_predictions, references)
 
     # --------------- Baseline (antes do FT) ---------------
     base_model = AutoModelForQuestionAnswering.from_pretrained(args.base_model)
-    baseline_args = TrainingArguments(
-        output_dir=args.output_dir + "/baseline",
-        per_device_eval_batch_size=args.eval_batch,
-        seed=args.seed,
-        report_to="none",
-    )
-    baseline_trainer = Trainer(
-        model=base_model,
-        args=baseline_args,
-        eval_dataset=eval_feats.remove_columns([c for c in eval_feats.column_names if c not in ("input_ids", "attention_mask")]),
-        tokenizer=tokenizer,
-        data_collator=default_data_collator,
-        compute_metrics=compute_metrics,
-        post_process_function=lambda examples, features, outputs: post_processing_function(
-            eval_examples, eval_feats, outputs, stage="baseline"
-        ),
-    )
     print("\n[Baseline] Avaliando modelo base (sem fine-tuning)...")
-    baseline_metrics = baseline_trainer.evaluate(eval_dataset=eval_feats)
+    baseline_metrics = evaluate_model(base_model, eval_examples, eval_feats, prefix="baseline")
     print("[Baseline] Métricas:", baseline_metrics)
 
     # --------------- Fine-Tuning ---------------
@@ -431,39 +395,32 @@ def main():
         hub_private_repo=args.hub_private,
         report_to="none",
     )
-
     trainer = Trainer(
         model=ft_model,
         args=training_args,
         train_dataset=train_feats,
-        eval_dataset=eval_feats.remove_columns([c for c in eval_feats.column_names if c not in ("input_ids", "attention_mask")]),
+        eval_dataset=eval_feats.remove_columns(
+            [c for c in eval_feats.column_names if c not in ("input_ids", "attention_mask")]
+        ),
         tokenizer=tokenizer,
         data_collator=default_data_collator,
-        compute_metrics=compute_metrics,
-        post_process_function=lambda examples, features, outputs: post_processing_function(
-            eval_examples, eval_feats, outputs, stage="eval"
-        ),
+        compute_metrics=None,  # métricas faremos no evaluate_model() abaixo
     )
 
     trainer.train()
 
     # --------------- Avaliação pós-treino ---------------
     print("\n[Fine-tuned] Avaliando modelo após fine-tuning...")
-    ft_metrics = trainer.evaluate(eval_dataset=eval_feats)
+    ft_metrics = evaluate_model(ft_model, eval_examples, eval_feats, prefix="finetuned")
     print("[Fine-tuned] Métricas:", ft_metrics)
 
     # --------------- Amostras com Top-3 e “confiança” ---------------
-    # Seleciona N exemplos da validação e gera top-3
     n_samples = min(args.sample_predictions, len(eval_examples))
-    sample_idxs = list(range(n_samples))
     samples = []
     ft_model.eval()
-    for idx in sample_idxs:
+    for idx in range(n_samples):
         ex = eval_examples[idx]
-        q = ex["question"]
-        ctx = ex["context"]
-
-        # Tokenização com offsets para recorte do CONTEXTO
+        q, ctx = ex["question"], ex["context"]
         enc = tokenizer(
             q, ctx,
             return_tensors="pt",
@@ -472,19 +429,17 @@ def main():
             stride=args.doc_stride,
             return_offsets_mapping=True
         )
-        with torch.no_grad():  # << TROCA NP.NO_GRAD POR TORCH.NO_GRAD
+        with torch.no_grad():
             out = ft_model(**{kk: vv for kk, vv in enc.items() if kk in ("input_ids","attention_mask","token_type_ids")})
 
         start = out.start_logits[0].cpu().numpy()
         end   = out.end_logits[0].cpu().numpy()
 
-        # Busca combinatória top-n
         n_best_size = 20
         max_answer_length = 30
         start_idx = np.argsort(start)[-n_best_size:][::-1]
         end_idx   = np.argsort(end)[-n_best_size:][::-1]
 
-        # offsets + sequence_ids(0) para filtrar só tokens do CONTEXTO
         offsets = enc["offset_mapping"][0].cpu().numpy().tolist()
         seq_ids = enc.sequence_ids(0)
         context_token_ids = {i for i, sid in enumerate(seq_ids) if sid == 1}
@@ -500,13 +455,12 @@ def main():
                 _, ec = offsets[e]
                 if sc is None or ec is None:
                     continue
-                text = ctx[sc:ec].strip()  # << RECORTE DO CONTEXTO
+                text = ctx[sc:ec].strip()
                 if not text:
                     continue
                 score = float(start[s] + end[e])
                 prelim.append({"text": text, "score": score})
 
-        # dedup + softmax
         dedup = {}
         for c in prelim:
             t = c["text"]
@@ -525,7 +479,7 @@ def main():
             "id": ex["id"],
             "question": q,
             "topk": nbest,
-            "gold": ex["answers"]["text"] if "answers" in ex else [],
+            "gold": ex.get("answers", {}).get("text", []),
         })
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
@@ -537,10 +491,8 @@ def main():
     if args.push_to_hub:
         trainer.push_to_hub(commit_message="CI: push DistilBERT QA (subset)")
 
-    # Loga baseline x ft para comparação
     with open(Path(args.output_dir) / "metrics_summary.json", "w") as f:
         json.dump({"baseline": baseline_metrics, "fine_tuned": ft_metrics}, f, indent=2)
-
 
 if __name__ == "__main__":
     main()
